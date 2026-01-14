@@ -2,7 +2,7 @@
 
 A PyQt5-based desktop application designed for **TQQQ (ProShares UltraPro QQQ)** trading analysis. It visualizes market trends using **SuperTrend**, identifies **12 key candlestick patterns**, and calculates **Pattern Energy** to gauge market sentiment.
 
-![Dashboard Preview](https://via.placeholder.com/800x400?text=Stock+Trigger+Dashboard) *(Replace with actual screenshot)*
+![Dashboard Preview](screenshot.png)
 
 ## Backtest Performance (TQQQ)
 
