@@ -1,7 +1,9 @@
 import sys
+import json
 import numpy as np
 from dataclasses import dataclass
 from typing import Optional
+from pathlib import Path
 import strategy
 
 import mplfinance as mpf
@@ -12,7 +14,7 @@ from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
 import matplotlib.pyplot as plt
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt5.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -43,6 +45,10 @@ LOOKBACK_DAYS = {
     "6mo": 180,
     "1y": 365,
 }
+
+# Persist recent symbols and last selected symbol across app restarts.
+UI_STATE_FILE = Path(".trigger_ui_state.json")
+MAX_RECENT_SYMBOLS = 10
 
 # Add buffer days for EMA calculation (need at least 50 candles before display window)
 FETCH_BUFFER_DAYS = 100
@@ -104,7 +110,8 @@ class DataWorker(QThread):
 
             # Strategy & Indicators
             ema_df = strategy.add_indicators(data)
-            ema_df = strategy.calculate_signals_variant(ema_df, "supertrend")
+            # Keep chart buy/sell markers aligned with the backtest baseline logic.
+            ema_df = strategy.calculate_signals_variant(ema_df, "conservative")
             
             # Filter Display Window
             cutoff = ema_df.index.max() - pd.Timedelta(days=display_days)
@@ -124,9 +131,14 @@ class StockTriggerApp(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("EMA Trigger Dashboard")
-        self.resize(1100, 700)
+        self.resize(1200, 1200)
+        self.recent_symbols = []
+        self.last_symbol = "TQQQ"
+        self._load_ui_state()
 
         self._init_ui()
+        # Auto-load the most recent symbol once the window event loop starts.
+        QTimer.singleShot(0, self.handle_fetch)
 
     def _init_ui(self) -> None:
         central_widget = QWidget()
@@ -138,11 +150,16 @@ class StockTriggerApp(QMainWindow):
         controls_layout = QHBoxLayout()
         controls_layout.setSpacing(12)
 
-        self.symbol_input = QLineEdit()
-        self.symbol_input.setPlaceholderText("e.g., TQQQ, SQQQ, AAPL")
-        self.symbol_input.setText("TQQQ")
-        self.symbol_input.setMaximumWidth(180)
-        self.symbol_input.returnPressed.connect(self.handle_fetch)
+        self.symbol_input = QComboBox()
+        self.symbol_input.setEditable(True)
+        self.symbol_input.setInsertPolicy(QComboBox.NoInsert)
+        self.symbol_input.setMaximumWidth(200)
+        self.symbol_input.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        self.symbol_input.setToolTip("Type ticker or pick from recent symbols")
+        self.symbol_input.lineEdit().setPlaceholderText("e.g., TQQQ, SQQQ, AAPL")
+        self.symbol_input.activated.connect(lambda _: self.handle_fetch())
+        self._refresh_symbol_combo()
+        self.symbol_input.lineEdit().returnPressed.connect(self.handle_fetch)
 
         self.lookback_combo = QComboBox()
         for label, value in LOOKBACK_OPTIONS.items():
@@ -167,10 +184,18 @@ class StockTriggerApp(QMainWindow):
         self.show_macd_cb = QCheckBox("MACD")
         self.show_macd_cb.setChecked(True)
         self.show_macd_cb.stateChanged.connect(self.update_chart_layout)
+
+        self.show_supertrend_cb = QCheckBox("SuperTrend")
+        self.show_supertrend_cb.setChecked(True)
+        self.show_supertrend_cb.stateChanged.connect(self.update_chart_layout)
         
         self.show_adx_cb = QCheckBox("ADX/DMI")
         self.show_adx_cb.setChecked(True)
         self.show_adx_cb.stateChanged.connect(self.update_chart_layout)
+
+        self.show_rsi_cb = QCheckBox("RSI")
+        self.show_rsi_cb.setChecked(True)
+        self.show_rsi_cb.stateChanged.connect(self.update_chart_layout)
 
         controls_layout.addWidget(QLabel("Symbol"))
         controls_layout.addWidget(self.symbol_input)
@@ -182,8 +207,10 @@ class StockTriggerApp(QMainWindow):
         controls_layout.addWidget(QLabel("|"))
         controls_layout.addWidget(QLabel("Show:"))
         controls_layout.addWidget(self.show_volume_cb)
+        controls_layout.addWidget(self.show_supertrend_cb)
         controls_layout.addWidget(self.show_macd_cb)
         controls_layout.addWidget(self.show_adx_cb)
+        controls_layout.addWidget(self.show_rsi_cb)
         controls_layout.addStretch(1)
 
         root_layout.addLayout(controls_layout)
@@ -210,6 +237,14 @@ class StockTriggerApp(QMainWindow):
 
         root_layout.addWidget(self.canvas, stretch=1)
 
+        # Hover price display (no chart overlays)
+        self._base_status_text = "Ready"
+        self._hover_line = None
+        self._hover_text = None
+        self._hover_ylim = None
+        self.canvas.mpl_connect("motion_notify_event", self._on_mouse_move)
+
+
     def update_chart_layout(self) -> None:
         """Recreate chart layout based on checkbox states."""
         self.figure.clear()
@@ -218,6 +253,7 @@ class StockTriggerApp(QMainWindow):
         show_volume = self.show_volume_cb.isChecked()
         show_macd = self.show_macd_cb.isChecked()
         show_adx = self.show_adx_cb.isChecked()
+        show_rsi = self.show_rsi_cb.isChecked()
         
         # Build height ratios dynamically
         num_panels = 1  # Always have price
@@ -230,6 +266,9 @@ class StockTriggerApp(QMainWindow):
             num_panels += 1
             height_ratios.append(1)
         if show_adx:
+            num_panels += 1
+            height_ratios.append(1)
+        if show_rsi:
             num_panels += 1
             height_ratios.append(1)
         
@@ -256,18 +295,25 @@ class StockTriggerApp(QMainWindow):
             
         if show_adx:
             self.adx_ax = self.figure.add_subplot(grid[panel_idx, 0], sharex=self.price_ax)
+            panel_idx += 1
         else:
             self.adx_ax = None
+
+        if show_rsi:
+            self.rsi_ax = self.figure.add_subplot(grid[panel_idx, 0], sharex=self.price_ax)
+        else:
+            self.rsi_ax = None
         
         # Re-plot if we have data
         if self.current_data is not None:
             self.update_plot(self.current_data)
 
     def handle_fetch(self) -> None:
-        symbol = self.symbol_input.text().strip().upper()
+        symbol = self._get_symbol_text()
         if not symbol:
             QMessageBox.warning(self, "Input Required", "Please enter a ticker symbol.")
             return
+        self._remember_symbol(symbol)
 
         display_period = self.lookback_combo.currentData() # e.g. "1y"
         lookback_days = LOOKBACK_DAYS.get(display_period, 365)
@@ -286,7 +332,7 @@ class StockTriggerApp(QMainWindow):
     def on_data_success(self, display_df, full_df, trigger):
         self.current_data = display_df
         self.update_plot(display_df)
-        
+
         self.trigger_label.setText(f"Trigger: {trigger.message}")
         self.trigger_label.setStyleSheet(
             f"font-weight: bold; font-size: 16px; color: {trigger.color};"
@@ -294,6 +340,7 @@ class StockTriggerApp(QMainWindow):
         self.status_label.setText(
             f"Showing {len(display_df)} candles ({self.lookback_combo.currentText()}, {self.interval_combo.currentText().lower()})"
         )
+        self._base_status_text = self.status_label.text()
 
     def on_data_error(self, error_msg):
         self.status_label.setText("Error")
@@ -306,9 +353,11 @@ class StockTriggerApp(QMainWindow):
         if self.volume_ax: self.volume_ax.clear()
         if self.macd_ax: self.macd_ax.clear()
         if self.adx_ax: self.adx_ax.clear()
+        if self.rsi_ax: self.rsi_ax.clear()
 
         price_df = data.copy()
         x_indices = np.arange(len(price_df))
+        show_supertrend = self.show_supertrend_cb.isChecked()
         
         # --- SuperTrend Lines ---
         st_up = price_df["SuperTrend"].copy()
@@ -319,11 +368,8 @@ class StockTriggerApp(QMainWindow):
         # --- Buy/Sell Signals ---
         buy_signals = pd.Series(np.nan, index=price_df.index)
         sell_signals = pd.Series(np.nan, index=price_df.index)
-        st_dir = price_df["SuperTrend_Dir"]
-        st_dir_prev = st_dir.shift(1)
-        
-        buy_mask = (st_dir == 1) & (st_dir_prev == -1)
-        sell_mask = (st_dir == -1) & (st_dir_prev == 1)
+        buy_mask = price_df["Buy_Signal"].fillna(False)
+        sell_mask = price_df["Sell_Signal"].fillna(False)
         
         buy_signals[buy_mask] = price_df.loc[buy_mask, "Low"] * 0.98
         sell_signals[sell_mask] = price_df.loc[sell_mask, "High"] * 1.02
@@ -351,13 +397,14 @@ class StockTriggerApp(QMainWindow):
         price_addplots = [
             mpf.make_addplot(price_df["EMA20"], ax=self.price_ax, color="orange", width=0.8),
             mpf.make_addplot(price_df["EMA50"], ax=self.price_ax, color="blue", width=0.8),
-            mpf.make_addplot(st_up, ax=self.price_ax, color="green", width=2.0),
-            mpf.make_addplot(st_down, ax=self.price_ax, color="red", width=2.0),
             mpf.make_addplot(buy_signals, ax=self.price_ax, type='scatter', markersize=140, marker='^', color='green'),
             mpf.make_addplot(sell_signals, ax=self.price_ax, type='scatter', markersize=140, marker='v', color='red'),
             mpf.make_addplot(bull_pat_signals, ax=self.price_ax, type='scatter', markersize=100, marker='*', color='#00FF00'),
             mpf.make_addplot(bear_pat_signals, ax=self.price_ax, type='scatter', markersize=100, marker='*', color='#FF0000'),
         ]
+        if show_supertrend:
+            price_addplots.insert(2, mpf.make_addplot(st_up, ax=self.price_ax, color="green", width=2.0))
+            price_addplots.insert(3, mpf.make_addplot(st_down, ax=self.price_ax, color="red", width=2.0))
 
         # 1. Plot Candle and Main Indicators
         mpf.plot(
@@ -370,6 +417,93 @@ class StockTriggerApp(QMainWindow):
             show_nontrading=False,
             datetime_format="%Y-%m-%d",
         )
+
+        # Volume MA20 overlay on the volume panel.
+        if self.volume_ax:
+            vol_ma20 = price_df.get("Volume_MA20", price_df["Volume"].rolling(window=20).mean())
+            self.volume_ax.plot(
+                x_indices,
+                vol_ma20,
+                color="#ff8c00",
+                lw=1.0,
+                label="Vol MA20",
+            )
+            if "Volume_Climax" in price_df.columns:
+                climax_mask = price_df["Volume_Climax"].fillna(False).to_numpy()
+                if climax_mask.any():
+                    self.volume_ax.bar(
+                        x_indices[climax_mask],
+                        price_df["Volume"].to_numpy()[climax_mask],
+                        color="#5a189a",
+                        alpha=0.45,
+                        width=0.7,
+                        label="Climax",
+                    )
+            if "Volume_Blowoff_Top" in price_df.columns:
+                blowoff_mask = price_df["Volume_Blowoff_Top"].fillna(False).to_numpy()
+                if blowoff_mask.any():
+                    self.volume_ax.bar(
+                        x_indices[blowoff_mask],
+                        price_df["Volume"].to_numpy()[blowoff_mask],
+                        color="#111111",
+                        alpha=0.6,
+                        width=0.7,
+                        label="Blow-off",
+                    )
+            if "Volume_Weak_Caution" in price_df.columns:
+                weak_caution = price_df["Volume_Weak_Caution"].fillna(False).to_numpy()
+                if weak_caution.any():
+                    self.volume_ax.scatter(
+                        x_indices[weak_caution],
+                        price_df["Volume"].to_numpy()[weak_caution],
+                        marker="x",
+                        s=16,
+                        color="#f1c40f",
+                        label="Weak Caution",
+                    )
+            if "Volume_Weak_Warning" in price_df.columns:
+                weak_warning = price_df["Volume_Weak_Warning"].fillna(False).to_numpy()
+                if weak_warning.any():
+                    self.volume_ax.scatter(
+                        x_indices[weak_warning],
+                        price_df["Volume"].to_numpy()[weak_warning],
+                        marker="x",
+                        s=20,
+                        color="#e67e22",
+                        label="Weak Warning",
+                    )
+            if "Volume_Weak_Risk" in price_df.columns:
+                weak_risk = price_df["Volume_Weak_Risk"].fillna(False).to_numpy()
+                if weak_risk.any():
+                    self.volume_ax.scatter(
+                        x_indices[weak_risk],
+                        price_df["Volume"].to_numpy()[weak_risk],
+                        marker="x",
+                        s=24,
+                        color="#c0392b",
+                        label="Weak Risk",
+                    )
+            self.volume_ax.legend(loc="upper left", fontsize=8, frameon=False)
+
+        # 1.5 Fibonacci Retracement (lookback high/low)
+        swing_high = price_df["High"].max()
+        swing_low = price_df["Low"].min()
+        if swing_high > swing_low:
+            fib_levels = [0.236, 0.382, 0.5, 0.618, 0.786]
+            fib_colors = ["#7a7a7a", "#6f6f6f", "#646464", "#595959", "#4e4e4e"]
+            for lvl, color in zip(fib_levels, fib_colors):
+                price = swing_high - (swing_high - swing_low) * lvl
+                self.price_ax.axhline(price, color=color, lw=1.0, ls=":", alpha=0.7)
+                self.price_ax.text(
+                    1.003,
+                    price,
+                    f"{lvl:.3f}",
+                    transform=self.price_ax.get_yaxis_transform(),
+                    color=color,
+                    fontsize=7,
+                    ha="left",
+                    va="center",
+                )
 
         # 2. Manually Plot MACD if axis exists
         if self.macd_ax:
@@ -391,8 +525,17 @@ class StockTriggerApp(QMainWindow):
             self.adx_ax.legend(loc="upper left", fontsize=8, frameon=False)
             self.adx_ax.set_ylabel("ADX/DMI")
 
+        # 4. Manually Plot RSI if axis exists
+        if self.rsi_ax:
+            self.rsi_ax.plot(x_indices, price_df["RSI"], color="black", lw=1.0, label="RSI")
+            self.rsi_ax.axhline(70, color="red", lw=0.8, ls="--", alpha=0.5)
+            self.rsi_ax.axhline(30, color="green", lw=0.8, ls="--", alpha=0.5)
+            self.rsi_ax.set_ylim(0, 100)
+            self.rsi_ax.legend(loc="upper left", fontsize=8, frameon=False)
+            self.rsi_ax.set_ylabel("RSI")
+
         # 4. Final Formatting for all visible axes
-        all_axes = [ax for ax in [self.price_ax, self.volume_ax, self.macd_ax, self.adx_ax] if ax is not None]
+        all_axes = [ax for ax in [self.price_ax, self.volume_ax, self.macd_ax, self.adx_ax, self.rsi_ax] if ax is not None]
         for ax in all_axes:
             ax.set_xlim(-0.5, len(price_df) - 0.5)
             ax.yaxis.set_label_position("left")
@@ -413,17 +556,59 @@ class StockTriggerApp(QMainWindow):
         )
 
         # Price Legend
-        self.price_ax.legend(
-            [
-                Line2D([0], [0], color="orange", lw=1.0),
-                Line2D([0], [0], color="blue", lw=1.0),
-                Line2D([0], [0], color="green", lw=2.0), 
+        legend_handles = [
+            Line2D([0], [0], color="orange", lw=1.0),
+            Line2D([0], [0], color="blue", lw=1.0),
+        ]
+        legend_labels = ["EMA20", "EMA50"]
+        if show_supertrend:
+            legend_handles.extend([
+                Line2D([0], [0], color="green", lw=2.0),
                 Line2D([0], [0], color="red", lw=2.0),
-                Line2D([0], [0], marker='*', color='#00FF00', linestyle='None', markersize=10),
-                Line2D([0], [0], marker='*', color='#FF0000', linestyle='None', markersize=10),
-            ],
-            ["EMA20", "EMA50", "ST Bull", "ST Bear", "Bull Pattern", "Bear Pattern"],
-            loc="upper left", fontsize=9, frameon=True
+            ])
+            legend_labels.extend(["ST Bull", "ST Bear"])
+        legend_handles.extend([
+            Line2D([0], [0], marker='*', color='#00FF00', linestyle='None', markersize=10),
+            Line2D([0], [0], marker='*', color='#FF0000', linestyle='None', markersize=10),
+        ])
+        legend_labels.extend(["Bull Pattern", "Bear Pattern"])
+        self.price_ax.legend(legend_handles, legend_labels, loc="upper left", fontsize=9, frameon=True)
+
+        # Last close label near the latest candle
+        last_idx = len(price_df) - 1
+        last_close = price_df["Close"].iloc[-1]
+        self.price_ax.text(
+            last_idx + 0.2,
+            last_close,
+            f"{last_close:,.2f}",
+            color="#111111",
+            fontsize=8,
+            va="center",
+            ha="left",
+            bbox=dict(boxstyle="round,pad=0.15", facecolor="white", edgecolor="#cccccc", alpha=0.8),
+        )
+
+        # Hover line/text prepared after autoscale settles
+        self._hover_ylim = self.price_ax.get_ylim()
+        self._hover_line = self.price_ax.axhline(
+            0,
+            color="#444444",
+            lw=0.8,
+            ls=":",
+            alpha=0.6,
+            visible=False,
+        )
+        self._hover_text = self.price_ax.text(
+            1.003,
+            0,
+            "",
+            transform=self.price_ax.get_yaxis_transform(),
+            color="#222222",
+            fontsize=8,
+            ha="left",
+            va="center",
+            bbox=dict(boxstyle="round,pad=0.15", facecolor="white", edgecolor="#cccccc", alpha=0.8),
+            visible=False,
         )
 
         # --- Annotate Patterns (Educational Mode) ---
@@ -474,6 +659,82 @@ class StockTriggerApp(QMainWindow):
                 self.price_ax.text(i, highs[i] * 1.05, lbl, color='#CC0000', fontsize=7, ha='center', va='bottom', rotation=0, fontweight='bold')
 
         self.canvas.draw_idle()
+
+    def _on_mouse_move(self, event) -> None:
+        if self.current_data is None or event.inaxes != self.price_ax:
+            self.status_label.setText(self._base_status_text)
+            if self._hover_line:
+                self._hover_line.set_visible(False)
+            if self._hover_text:
+                self._hover_text.set_visible(False)
+            return
+        if event.xdata is None or event.ydata is None:
+            self.status_label.setText(self._base_status_text)
+            if self._hover_line:
+                self._hover_line.set_visible(False)
+            if self._hover_text:
+                self._hover_text.set_visible(False)
+            return
+
+        y = float(event.ydata)
+        self.status_label.setText(f"Price: {y:,.2f}")
+        if self._hover_line:
+            self._hover_line.set_ydata([y, y])
+            self._hover_line.set_visible(True)
+        if self._hover_text:
+            self._hover_text.set_position((1.003, y))
+            self._hover_text.set_text(f"{y:,.2f}")
+            self._hover_text.set_visible(True)
+        if self._hover_ylim:
+            self.price_ax.set_ylim(self._hover_ylim)
+        self.canvas.draw_idle()
+
+    def _get_symbol_text(self) -> str:
+        return self.symbol_input.currentText().strip().upper()
+
+    def _refresh_symbol_combo(self) -> None:
+        current = self.last_symbol if self.last_symbol else "TQQQ"
+        self.symbol_input.blockSignals(True)
+        self.symbol_input.clear()
+        for sym in self.recent_symbols:
+            self.symbol_input.addItem(sym)
+        if current and current not in self.recent_symbols:
+            self.symbol_input.addItem(current)
+        self.symbol_input.setCurrentText(current)
+        self.symbol_input.blockSignals(False)
+
+    def _remember_symbol(self, symbol: str) -> None:
+        if symbol in self.recent_symbols:
+            self.recent_symbols.remove(symbol)
+        self.recent_symbols.insert(0, symbol)
+        self.recent_symbols = self.recent_symbols[:MAX_RECENT_SYMBOLS]
+        self.last_symbol = symbol
+        self._refresh_symbol_combo()
+        self._save_ui_state()
+
+    def _load_ui_state(self) -> None:
+        try:
+            if UI_STATE_FILE.exists():
+                with UI_STATE_FILE.open("r", encoding="utf-8") as f:
+                    state = json.load(f)
+                recents = state.get("recent_symbols", [])
+                self.recent_symbols = [str(s).upper() for s in recents if str(s).strip()]
+                self.recent_symbols = self.recent_symbols[:MAX_RECENT_SYMBOLS]
+                self.last_symbol = str(state.get("last_symbol", self.last_symbol)).upper()
+        except Exception:
+            self.recent_symbols = []
+            self.last_symbol = "TQQQ"
+
+    def _save_ui_state(self) -> None:
+        state = {
+            "recent_symbols": self.recent_symbols[:MAX_RECENT_SYMBOLS],
+            "last_symbol": self.last_symbol,
+        }
+        try:
+            with UI_STATE_FILE.open("w", encoding="utf-8") as f:
+                json.dump(state, f, ensure_ascii=True, indent=2)
+        except Exception:
+            pass
 
 
 def main() -> None:

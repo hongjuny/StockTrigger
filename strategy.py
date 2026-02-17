@@ -113,6 +113,13 @@ def add_indicators(data: pd.DataFrame) -> pd.DataFrame:
     df["EMA50"] = df["Close"].ewm(span=50, adjust=False).mean()
     df["EMA200"] = df["Close"].ewm(span=200, adjust=False).mean()
 
+    # --- Bollinger Bands (20, 2.5) ---
+    bb_mid = df["Close"].rolling(window=20).mean()
+    bb_std = df["Close"].rolling(window=20).std()
+    df["BB_Mid"] = bb_mid
+    df["BB_Upper"] = bb_mid + (2.5 * bb_std)
+    df["BB_Lower"] = bb_mid - (2.5 * bb_std)
+
     # --- MACD ---
     # Standard: Fast=12, Slow=26, Signal=9
     ema12 = df["Close"].ewm(span=12, adjust=False).mean()
@@ -232,6 +239,35 @@ def add_indicators(data: pd.DataFrame) -> pd.DataFrame:
     loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/14, adjust=False).mean()
     rs = gain / loss
     df["RSI"] = 100 - (100 / (1 + rs))
+
+    # --- Volume Context (20-day baseline) ---
+    vol = df["Volume"].astype("float64")
+    df["Volume_MA20"] = vol.rolling(window=20).mean()
+    df["Volume_Ratio"] = vol / df["Volume_MA20"]
+
+    price_up = df["Close"] > df["Close"].shift(1)
+    adx_falling = df["ADX"] < df["ADX"].shift(1)
+
+    # Weak rally requires underpowered volume and weakening trend strength.
+    df["Volume_Weak_Rally"] = price_up & (vol < (df["Volume_MA20"] * 0.8)) & adx_falling
+
+    # Graded warning levels for weak-rally context.
+    df["Volume_Weak_Caution"] = price_up & adx_falling & (vol < (df["Volume_MA20"] * 0.9))
+    df["Volume_Weak_Warning"] = price_up & adx_falling & (vol < (df["Volume_MA20"] * 0.7))
+    df["Volume_Weak_Risk"] = price_up & adx_falling & (vol < (df["Volume_MA20"] * 0.5))
+
+    # General abnormal volume spike.
+    df["Volume_Climax"] = vol > (df["Volume_MA20"] * 2.5)
+    # Blow-off top condition.
+    daily_return = (df["Close"] / df["Close"].shift(1)) - 1.0
+    df["Volume_Blowoff_Top"] = (daily_return > 0.03) & (vol > (df["Volume_MA20"] * 2.0)) & (df["RSI"] > 80)
+
+    up_candle = df["Close"] > df["Open"]
+    down_candle = df["Close"] < df["Open"]
+    df["Volume_Accumulation_Day"] = up_candle & (vol > df["Volume_MA20"])
+    df["Volume_Distribution_Day"] = down_candle & (vol > df["Volume_MA20"])
+    df["Volume_Accumulation_10d"] = df["Volume_Accumulation_Day"].rolling(10).sum()
+    df["Volume_Distribution_10d"] = df["Volume_Distribution_Day"].rolling(10).sum()
 
     # --- New Indicators for TQQQ ---
     # SMA 200 (Long-term trend filter)
@@ -437,23 +473,48 @@ def detect_trigger(data: pd.DataFrame) -> TriggerResult:
     
     energy_msg = f" | 20d Pattern Energy: {bull_count} Bull vs {bear_count} Bear ({sentiment})"
 
+    # --- Volume Context Message ---
+    volume_notes = []
+    if "Volume_Weak_Risk" in data.columns and bool(last["Volume_Weak_Risk"]):
+        volume_notes.append("Weak Rally Risk")
+    elif "Volume_Weak_Warning" in data.columns and bool(last["Volume_Weak_Warning"]):
+        volume_notes.append("Weak Rally Warning")
+    elif "Volume_Weak_Caution" in data.columns and bool(last["Volume_Weak_Caution"]):
+        volume_notes.append("Weak Rally Caution")
+
+    if "Volume_Blowoff_Top" in data.columns and bool(last["Volume_Blowoff_Top"]):
+        volume_notes.append("Blow-off Top")
+    elif "Volume_Climax" in data.columns and bool(last["Volume_Climax"]):
+        volume_notes.append("Climax Volume")
+    if "Volume_Accumulation_10d" in data.columns and "Volume_Distribution_10d" in data.columns:
+        accum_10 = float(last["Volume_Accumulation_10d"])
+        dist_10 = float(last["Volume_Distribution_10d"])
+        if accum_10 >= dist_10 + 2:
+            volume_notes.append("Accumulation Bias")
+        elif dist_10 >= accum_10 + 2:
+            volume_notes.append("Distribution Bias")
+
+    volume_msg = ""
+    if volume_notes:
+        volume_msg = " | Vol: " + ", ".join(volume_notes)
+
     # 1. BULLISH SCENARIO
     if st_dir == 1:
         if st_dir_prev == -1:
-            msg = f"★ BUY SIGNAL (Flip) on {date_str}{pat_str}{energy_msg}"
+            msg = f"★ BUY SIGNAL (Flip) on {date_str}{pat_str}{energy_msg}{volume_msg}"
             color = "#00cc00" # Bright Green
         else:
-            msg = f"HOLD LONG (Trend is Bullish) since {date_str}{pat_str}{energy_msg}"
+            msg = f"HOLD LONG (Trend is Bullish) since {date_str}{pat_str}{energy_msg}{volume_msg}"
             color = "#2ca02c" # Standard Green
         return TriggerResult(msg, color)
 
     # 2. BEARISH SCENARIO
     if st_dir == -1:
         if st_dir_prev == 1:
-            msg = f"★ SELL SIGNAL (Flip) on {date_str}{pat_str}{energy_msg}"
+            msg = f"★ SELL SIGNAL (Flip) on {date_str}{pat_str}{energy_msg}{volume_msg}"
             color = "#ff0000" # Bright Red
         else:
-            msg = f"STAY CASH (Trend is Bearish) since {date_str}{pat_str}{energy_msg}"
+            msg = f"STAY CASH (Trend is Bearish) since {date_str}{pat_str}{energy_msg}{volume_msg}"
             color = "#ff7f0e" # Orange
         return TriggerResult(msg, color)
 

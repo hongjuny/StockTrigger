@@ -40,3 +40,4 @@ strategy_comparison.png
 # OS
 .DS_Store
 Thumbs.db
+.aider*
